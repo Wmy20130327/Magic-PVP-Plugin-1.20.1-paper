@@ -1,0 +1,8 @@
+name: MiniClasses
+version: 1.0
+main: com.miniclass.MiniClassPlugin
+api-version: '1.20'
+commands:
+  miniclass:
+    description: 打开职业选择菜单
+    usage: /miniclass
