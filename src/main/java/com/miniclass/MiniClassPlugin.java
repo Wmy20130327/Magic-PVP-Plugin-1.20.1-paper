@@ -174,11 +174,30 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         if (!player.isOnline()) return;
         HeroData hero = heroes.get(classId);
         if (hero == null) return;
+        // 先按当前形态清掉旧职业装备，再整套重发——修复死亡掉落/丢失部件无法补回的问题
+        clearHeroEquipment(player, hero);
         giveHeroEquipment(player, hero);
         if ("demon".equals(classId)) applyDemonPassives(player); // 死亡/重连恢复时同样补上被动增益
         AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
         player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
         player.sendMessage(ChatColor.YELLOW + "已自动恢复职业 [" + hero.name + "] 的装备！");
+    }
+
+    /** 从背包与装备栏中移除该英雄配置的装备（按显示名精确匹配，避免误删同名普通物品） */
+    private void clearHeroEquipment(Player player, HeroData hero) {
+        Set<String> names = new HashSet<>();
+        for (String eq : hero.equipData) {
+            String[] p = eq.split(":");
+            if (p.length >= 3) names.add(p[2]);
+        }
+        Inventory inv = player.getInventory();
+        ItemStack[] storage = inv.getContents();
+        for (int i = 0; i < storage.length; i++) {
+            ItemStack it = storage[i];
+            if (it != null && !displayName(it).isEmpty() && names.contains(displayName(it))) {
+                inv.setItem(i, null);
+            }
+        }
     }
 
     @Override
@@ -207,6 +226,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 for (int i = 4; i < p.length; i++) {
                     String f = p[i].trim();
                     if (f.isEmpty() || f.contains(";")) continue;
+                    // 带属性修饰的装备以空字段占位技能ID（如 "INV:ARROW:name:"），末段为空属正常格式
                     if (!skills.containsKey(f)) {
                         getLogger().warning("英雄 " + entry.getKey() + " 装备 " + p[2] + " 引用了未注册的技能 ID: " + f);
                     }
@@ -224,8 +244,11 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 "HELMET:IRON_HELMET:&e指引战盔:WATER_BREATHING:1:ARMOR;3",
                 "CHEST:IRON_CHESTPLATE:&c指引战甲:PROJECTILE_PROTECTION:2:ARMOR;3",
                 "BOOTS:IRON_BOOTS:&e指引战靴:FALL_PROTECTION:10:ARMOR;1",
+                // 天弓：力量I+无限（无限附魔需背包至少一支箭才能射击，故下方额外发放箭矢道具）
                 "MAIN:BOW:&6指引天弓:ARROW_DAMAGE:1,ARROW_INFINITE:1",
-                "INV:IRON_SWORD:&c指引匕首:DAMAGE_ALL:5:ATTACK_DAMAGE;5,ATTACK_SPEED;-2.5,LOOT_BONUS_BLOCKS:1",
+                "INV:ARROW:&e指引箭矢::guide_arrows",
+                // 匕首改为"箭"形态：外观为箭矢，但保留全部匕首功效（伤害/攻速/时运 + 近战攻击判定）
+                "INV:ARROW:&c指引匕首:DAMAGE_ALL:5:ATTACK_DAMAGE;5,ATTACK_SPEED;-2.5,LOOT_BONUS_BLOCKS:1",
                 "INV:ENDER_PEARL:&6庇护之瞬::guide_shelter",
                 "INV:MUSHROOM_STEW:&b疗养汤药::guide_soup");
 
@@ -237,6 +260,8 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 "LEGS:LEATHER_LEGGINGS:&c兽皮:FIRE_PROTECTION:5,PROJECTILE_PROTECTION:2,PROTECTION_EXPLOSIONS:2,PROTECTION:1:ARMOR;2",
                 "BOOTS:LEATHER_BOOTS:&c兽皮:FIRE_PROTECTION:5:ARMOR;1",
                 "MAIN:GOLDEN_AXE:&c兽爪:DAMAGE_ALL:2.5:demon_claw",
+                // 被动：进场获得伤害吸收II（8点黄血），CD 10s
+                "INV:GLISTERING_MELON_SLICE:&6野兽本能::demon_instinct",
                 "INV:COOKED_BEEF:&c兽之再生::demon_regen",
                 "INV:RED_DYE:&c兽欲返祖::demon_transform");
 
@@ -364,7 +389,9 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         // 地狱魔兽技能（右键触发，CD 由引擎统一处理；具体形态分支见 executeSkill 定制 case）
         regSkill("demon_claw", "DEMON_CLAW", 14, "0", "");       // 兽护/兽怒：右键自增益+回血
         regSkill("demon_regen", "DEMON_REGEN", 20, "0", "");      // 默认回15血+抗性II/吸收I；返祖蓄力冲刺
-        regSkill("demon_transform", "DEMON_TRANSFORM", 8, "0", ""); // 兽欲返祖：形态切换（不重置其他技能CD）
+        regSkill("demon_transform", "DEMON_TRANSFORM", 8, "0", ""); // 兽欲返祖
+        regSkill("demon_instinct", "BUFF", 10, "0", "ABSORPTION:200:1"); // 野兽本能：进场被动，伤害吸收II(8点黄血)持续10s
+        regSkill("guide_arrows", "NOOP", 0, "0", ""); // 指引箭矢：仅作无限弓的弹药载体，右键不产生技能效果：形态切换（不重置其他技能CD）
         regSkill("ender_punch", "TELEPORT", 1, "4", "REGENERATION:60:0");
         regSkill("ghost_dagger", "BUFF", 6, "0", "SPEED:80:0,REGENERATION:80:1");
         regSkill("ghost_dance", "TELEPORT", 0, "4", "INVISIBILITY:200:0");
@@ -794,6 +821,9 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             case "TOGGLE":
                 // 自身增益由后置 Buff 统一应用
                 break;
+            case "NOOP":
+                // 无技能效果（如纯弹药道具），仅消耗本次交互
+                break;
             default:
                 getLogger().warning("未知技能类型: " + skill.type);
         }
@@ -836,6 +866,8 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         UUID uuid = player.getUniqueId();
         long now = System.currentTimeMillis();
         healPlayer(player, 4);
+        // ===== 特效增强：治愈绿光笼罩 =====
+        player.getWorld().spawnParticle(Particle.VILLAGER_HAPPY, player.getLocation().add(0, 1.2, 0), 25, 0.4, 0.8, 0.4, 0.0);
         if (demonAtavism.contains(uuid)) {
             // 返祖：兽怒——自身获得5秒易伤（受到伤害+60%），期间发光/迅捷III/力量I
             applyDemonVulnerable(uuid, 100); // 易伤窗口覆盖兽怒全程并略留余量
@@ -843,6 +875,9 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 80, 2, true, true));
             player.addPotionEffect(new PotionEffect(PotionEffectType.INCREASE_DAMAGE, 80, 0, true, true));
             demonBuffEnd.put(uuid, now + 4000L);
+            // ===== 兽怒特效：红色怒气爆发环 + 灵魂火焰怒柱 + 劫掠兽咆哮 =====
+            spawnDemonRageEffects(player.getLocation());
+            player.playSound(player.getLocation(), Sound.ENTITY_RAVAGER_ROAR, 1.4f, 1.0f);
             player.sendMessage(ChatColor.DARK_RED + "\u517D\u6012\uff01\u4f64\u8eab\u7684\u91ce\u517d\u672c\u80fd\u82cf\u9192\u4e86\uff01"); // 兽怒！你自身的野兽本能苏醒了！
         } else {
             // 初始：兽护——发光I/迅捷I/生命恢复II 持续4s
@@ -850,9 +885,37 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 80, 0, true, true));
             player.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 80, 1, true, true));
             demonBuffEnd.put(uuid, now + 4000L);
+            // ===== 兽护特效：金色护盾光环 + 喜悦粒子 + 披甲羊嘶鸣 =====
+            World wsh = player.getWorld();
+            Location csh = player.getLocation();
+            for (int i = 0; i < 30; i++) {
+                double ang = (i / 30.0) * Math.PI * 2;
+                wsh.spawnParticle(Particle.SPELL_WITCH,
+                        csh.clone().add(Math.cos(ang) * 1.2, 1.0 + Math.sin(i * 0.7) * 0.4, Math.sin(ang) * 1.2),
+                        1, 0.0, 0.0, 0.0, 0.0);
+            }
+            wsh.spawnParticle(Particle.VILLAGER_HAPPY, csh.clone().add(0, 1.5, 0), 15, 0.4, 0.5, 0.4, 0.0);
+            player.playSound(player.getLocation(), Sound.ENTITY_SHEEP_AMBIENT, 1.2f, 0.6f);
             player.sendMessage(ChatColor.GREEN + "\u83b7\u5f97\u3010\u517D\u62a4\u3011\uff0c4\u79d2\u5185\u7528\u517D\u722A\u547d\u4e2d\u53ef\u5237\u65b0\u5e76\u56de\u8840\uff01"); // 获得【兽护】
         }
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_BURP, 1.0f, 0.8f);
+    }
+
+    /** 兽怒特效：双层红色冲击环（暴击+伤害指示粒子）+ 中心灵魂火焰怒柱 */
+    private void spawnDemonRageEffects(Location center) {
+        World w = center.getWorld();
+        if (w == null) return;
+        for (double radius = 1.0; radius <= 2.5; radius += 0.75) {
+            for (int i = 0; i < 20; i++) {
+                double angle = (i / 20.0) * Math.PI * 2;
+                w.spawnParticle(Particle.CRIT_MAGIC,
+                        center.clone().add(Math.cos(angle) * radius, 0.4, Math.sin(angle) * radius),
+                        2, 0.05, 0.1, 0.05, 0.1);
+                w.spawnParticle(Particle.DAMAGE_INDICATOR,
+                        center.clone().add(Math.cos(angle) * radius, 0.8, Math.sin(angle) * radius),
+                        1, 0.0, 0.0, 0.0, 0.0);
+            }
+        }
+        w.spawnParticle(Particle.SOUL_FIRE_FLAME, center.clone().add(0, 1, 0), 30, 0.35, 1.0, 0.35, 0.03);
     }
 
     /** 兽之再生：初始=回15滴血+10s抗性II+15s伤害吸收I；返祖=下潜定身蓄力2s后直线冲刺至多14格 */
@@ -865,7 +928,14 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         healPlayer(player, 15);
         player.addPotionEffect(new PotionEffect(PotionEffectType.DAMAGE_RESISTANCE, 200, 1, true, true));  // 10s 抗性II
         player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 300, 0, true, true));          // 15s 吸收I
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1.0f, 0.8f);
+        // ===== 特效增强：再生金光柱 + 治愈云 + 升级音效（金色光环让"回血+双buff"一眼可见）=====
+        Location rc = player.getLocation();
+        for (int y = 0; y < 4; y++) {
+            rc.getWorld().spawnParticle(Particle.VILLAGER_HAPPY, rc.clone().add(0, y * 0.6 + 0.3, 0), 8, 0.3, 0.1, 0.3, 0.0);
+        }
+        rc.getWorld().spawnParticle(Particle.VILLAGER_HAPPY, rc.clone().add(0, 1.2, 0), 25, 0.5, 0.8, 0.5, 0.0);
+        rc.getWorld().spawnParticle(Particle.SPELL_WITCH, rc.clone().add(0, 1.0, 0), 30, 0.4, 0.7, 0.4, 0.2);
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1.2f, 0.9f);
         player.sendMessage(ChatColor.GREEN + "\u517D\u4e4b\u518d\u751f\uff1a\u6062\u590d15\u70b9\u751f\u547d\uff01");
     }
 
@@ -884,21 +954,27 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         }
         player.teleport(down);
         player.addPotionEffect(new PotionEffect(PotionEffectType.DAMAGE_RESISTANCE, 100, 1, true, true)); // 蓄力期抗性II
-        player.getWorld().spawnParticle(Particle.SMOKE_NORMAL, player.getLocation(), 40, 0.8, 0.3, 0.8, 0.05);
-        player.playSound(player.getLocation(), Sound.ENTITY_GENERIC_EXPLODE, 0.6f, 1.5f);
+        // ===== 特效增强：兽之怒焰——以玩家为中心的3层火焰漩涡 + 地面火焰圈 + 低频咆哮 =====
+        Location chargeCenter = player.getLocation().clone();
+        spawnDemonChargeEffects(chargeCenter);
+        player.playSound(player.getLocation(), Sound.ENTITY_RAVAGER_ROAR, 1.2f, 0.7f);
         player.setVelocity(new Vector(0, 0.05, 0)); // 轻微上浮抵消坠落感，视觉上"定身"
         final Location chargeLoc = player.getLocation().clone();
-        // 蓄力2秒：每10tick对小范围(2.5格)敌人造成2点伤害；40tick后自动停止（与冲刺同时结束）
+        // 蓄力2秒：每5tick对小范围(2.5格)敌人造成2点伤害并附带点燃与粒子反馈；40tick后自动停止（与冲刺同时结束）
         final int[] chargeTicks = {0};
         Bukkit.getScheduler().runTaskTimer(this, task -> {
-            if (!player.isOnline() || player.isDead() || chargeTicks[0]++ >= 4) { task.cancel(); return; }
+            if (!player.isOnline() || player.isDead() || chargeTicks[0]++ >= 8) { task.cancel(); return; }
             for (Entity e : player.getNearbyEntities(2.5, 2.5, 2.5)) {
                 if (e instanceof LivingEntity && !(e instanceof Player && ((Player) e).getGameMode() == GameMode.CREATIVE)) {
-                    ((LivingEntity) e).damage(2.0, player);
+                    LivingEntity le = (LivingEntity) e;
+                    le.damage(2.0, player);
+                    le.setFireTicks(Math.max(le.getFireTicks(), 10)); // 蓄力气浪附带短暂点燃，让"AoE在生效"肉眼可见
+                    le.getWorld().spawnParticle(Particle.FLAME, le.getLocation().add(0, 1, 0), 8, 0.3, 0.4, 0.3, 0.05);
                 }
             }
-            player.getWorld().spawnParticle(Particle.ENCHANTMENT_TABLE, player.getLocation(), 20, 0.6, 0.8, 0.6, 0.1);
-        }, 0L, 10L);
+            // 持续视觉反馈：火焰光环逐圈扩散 + 上旋的怒焰粒子柱
+            spawnDemonChargeEffects(player.getLocation());
+        }, 0L, 5L);
         Bukkit.getScheduler().runTaskLater(this, () -> {
             if (!player.isOnline() || player.isDead()) return;
             // 冲刺：沿蓄力开始时的面向逐格推进，命中实体则停下结算
@@ -908,6 +984,12 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             dir.setY(0).normalize();
             demonDashActive.add(uuid);
             Location dashFrom = player.getLocation().clone();
+            // ===== 冲刺轨迹特效：沿路径逐格生成烟雾+火焰拖尾，14格冲刺全程可见 =====
+            for (int step = 1; step <= 14; step++) {
+                Location trail = dashFrom.clone().add(dir.clone().multiply(step));
+                trail.getWorld().spawnParticle(Particle.SMOKE_NORMAL, trail, 3, 0.2, 0.5, 0.2, 0.02);
+                trail.getWorld().spawnParticle(Particle.FLAME, trail, 4, 0.2, 0.4, 0.2, 0.02);
+            }
             boolean hitSomething = false;
             for (int step = 1; step <= 14; step++) {
                 Location probe = dashFrom.clone().add(dir.clone().multiply(step));
@@ -927,10 +1009,45 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 int ground = findGroundLevel(end.getWorld(), end.getBlockX(), end.getBlockZ());
                 if (ground >= 0) end.setY(Math.max(ground, dashFrom.getBlockY()));
                 player.teleport(end);
+                // 空冲刺落地也播放小型冲击特效，保证技能反馈完整
+                spawnDemonImpactEffects(end);
                 Bukkit.getScheduler().runTaskLater(MiniClassPlugin.this, () -> demonDashActive.remove(uuid), 10L);
             }
-            player.getWorld().spawnParticle(Particle.SMOKE_NORMAL, player.getLocation(), 25, 0.3, 0.3, 0.3, 0.05);
         }, 40L);
+    }
+
+    /** 蓄力特效：三层旋转火焰光环（半径2/2.5/3）+ 中心上旋怒焰粒子柱 */
+    private void spawnDemonChargeEffects(Location center) {
+        World w = center.getWorld();
+        if (w == null) return;
+        double phase = System.currentTimeMillis() / 120.0;
+        for (double radius = 2.0; radius <= 3.0; radius += 0.5) {
+            int count = (int) (radius * 8);
+            for (int i = 0; i < count; i++) {
+                double angle = (i / (double) count) * Math.PI * 2 + phase;
+                Location ring = center.clone().add(Math.cos(angle) * radius, 0.3, Math.sin(angle) * radius);
+                w.spawnParticle(Particle.FLAME, ring, 1, 0.05, 0.1, 0.05, 0.0);
+            }
+        }
+        w.spawnParticle(Particle.SOUL_FIRE_FLAME, center, 12, 0.4, 0.9, 0.4, 0.02);
+        w.spawnParticle(Particle.ENCHANTMENT_TABLE, center.clone().add(0, 1.2, 0), 15, 0.5, 0.6, 0.5, 0.15);
+    }
+
+    /** 冲刺命中/落地冲击特效：爆炸粒子 + 双层冲击波光环 + 火星飞溅 */
+    private void spawnDemonImpactEffects(Location at) {
+        World w = at.getWorld();
+        if (w == null) return;
+        w.spawnParticle(Particle.EXPLOSION_LARGE, at, 4, 0.3, 0.3, 0.3, 0.0);
+        w.spawnParticle(Particle.SMOKE_LARGE, at, 20, 0.5, 0.4, 0.5, 0.08);
+        for (double radius = 1.0; radius <= 3.0; radius += 1.0) {
+            for (int i = 0; i < 24; i++) {
+                double angle = (i / 24.0) * Math.PI * 2;
+                w.spawnParticle(Particle.SWEEP_ATTACK,
+                        at.clone().add(Math.cos(angle) * radius, 0.6, Math.sin(angle) * radius),
+                        1, 0.0, 0.0, 0.0, 0.0);
+            }
+        }
+        w.spawnParticle(Particle.LAVA, at, 10, 0.6, 0.5, 0.6, 0.0);
     }
 
     /** 查询以 loc 为中心 radius 范围内的实体（跨世界安全） */
@@ -954,8 +1071,11 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         if (kb.lengthSquared() > 1e-6) {
             target.setVelocity(kb.normalize().multiply(1.5).setY(0.5));
         }
-        player.getWorld().spawnParticle(Particle.EXPLOSION_NORMAL, target.getLocation(), 6, 0.3, 0.3, 0.3, 0.05);
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_ATTACK_CRIT, 1.0f, 0.7f);
+        // ===== 冲击结算特效：爆炸+冲击波环+火焰飞溅，命中反馈拉满 =====
+        spawnDemonImpactEffects(target.getLocation());
+        target.getWorld().spawnParticle(Particle.FLAME, target.getLocation().add(0, 1, 0), 20, 0.4, 0.6, 0.4, 0.05);
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_ATTACK_KNOCKBACK, 1.4f, 0.6f);
+        player.playSound(player.getLocation(), Sound.ENTITY_GENERIC_EXPLODE, 0.8f, 1.2f);
     }
 
     /** 兽欲返祖：切换形态，重新发放武器/防具（不重置其他技能CD），两种形态均回2血 */
@@ -973,8 +1093,24 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 200, 1, true, true));
             player.sendMessage(ChatColor.GREEN + "\u56de\u5230\u521d\u59cb\u5f62\u6001\uff0c\u83b7\u5f97\u4f24\u5bb3\u5438\u6536 II\uff01");
         }
+        // ===== 特效增强：形态切换——返祖=红色烈焰爆发+龙吟；回初始=蓝色净化环+铃音 =====
+        Location tc = player.getLocation();
+        if (toAtavism) {
+            spawnDemonRageEffects(tc);
+            tc.getWorld().spawnParticle(Particle.LAVA, tc.clone().add(0, 1, 0), 15, 0.5, 0.8, 0.5, 0.0);
+            player.playSound(player.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 1.2f);
+        } else {
+            for (int i = 0; i < 36; i++) {
+                double angle = (i / 36.0) * Math.PI * 2;
+                tc.getWorld().spawnParticle(Particle.PORTAL,
+                        tc.clone().add(Math.cos(angle) * 1.5, 0.5 + Math.sin(i * 0.5) * 0.5, Math.sin(angle) * 1.5),
+                        2, 0.05, 0.1, 0.05, 0.05);
+            }
+            tc.getWorld().spawnParticle(Particle.VILLAGER_HAPPY, tc.clone().add(0, 1.2, 0), 20, 0.4, 0.8, 0.4, 0.0);
+            player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.4f, 1.5f);
+        }
         player.playSound(player.getLocation(), Sound.ENTITY_WOLF_GROWL, 1.2f, 0.6f);
-        player.getWorld().spawnParticle(Particle.SMOKE_LARGE, player.getLocation(), 30, 0.5, 0.8, 0.5, 0.05);
+        tc.getWorld().spawnParticle(Particle.SMOKE_LARGE, tc, 30, 0.5, 0.8, 0.5, 0.05);
     }
 
     /** 回血（受最大血量上限约束） */
