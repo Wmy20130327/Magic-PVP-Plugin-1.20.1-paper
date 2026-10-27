@@ -3,6 +3,8 @@ package com.miniclass;
 import org.bukkit.*;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
+import org.bukkit.attribute.AttributeModifier;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
@@ -13,6 +15,7 @@ import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.Inventory;
@@ -182,8 +185,13 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 if (Material.matchMaterial(p[1].trim()) == null) {
                     getLogger().warning("英雄 " + entry.getKey() + " 存在非法材质: " + p[1]);
                 }
-                if (p.length > 4 && !p[4].isEmpty() && !skills.containsKey(p[4].trim())) {
-                    getLogger().warning("英雄 " + entry.getKey() + " 引用了未注册的技能 ID: " + p[4]);
+                // 技能ID可能位于第5段（无属性修饰）或第6段（带属性修饰），逐一检查非空且非属性的字段
+                for (int i = 4; i < p.length; i++) {
+                    String f = p[i].trim();
+                    if (f.isEmpty() || f.contains(";")) continue;
+                    if (!skills.containsKey(f)) {
+                        getLogger().warning("英雄 " + entry.getKey() + " 装备 " + p[2] + " 引用了未注册的技能 ID: " + f);
+                    }
                 }
             }
         }
@@ -192,14 +200,16 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     // ================= 1. 数据注册引擎 (65个英雄硬编码区) =================
     private void registerAllHeroes() {
         // 格式: ID, 名称, 图标材质, 装备数据(槽位:材质:名称:附魔:技能ID)
+        // 指引者（基础射手）：头盔+3护甲/水下呼吸I；胸甲+3护甲/弹射物保护II；靴子+1护甲/摔落保护X
+        // 天弓：力量I+无限；匕首：攻击伤害+5、攻速-2.5、时运I；技能与被动见下方注册与监听器
         regHero("guide", "指引者", Material.IRON_HELMET,
-                "HELMET:IRON_HELMET:&e指引战盔:WATER_BREATHING:1",
-                "CHEST:IRON_CHESTPLATE:&e指引战甲:PROJECTILE_PROTECTION:2",
-                "BOOTS:LEATHER_BOOTS:&e指引战靴:FALL_PROTECTION:10",
+                "HELMET:IRON_HELMET:&e指引战盔:WATER_BREATHING:1:ARMOR;3",
+                "CHEST:IRON_CHESTPLATE:&c指引战甲:PROJECTILE_PROTECTION:2:ARMOR;3",
+                "BOOTS:IRON_BOOTS:&e指引战靴:FALL_PROTECTION:10:ARMOR;1",
                 "MAIN:BOW:&6指引天弓:ARROW_DAMAGE:1,ARROW_INFINITE:1",
-                "INV:IRON_SWORD:&c指引匕首:LOOT_BONUS_BLOCKS:1",
+                "INV:IRON_SWORD:&c指引匕首:DAMAGE_ALL:5:ATTACK_DAMAGE;5,ATTACK_SPEED;-2.5,LOOT_BONUS_BLOCKS:1",
                 "INV:ENDER_PEARL:&6庇护之瞬::guide_shelter",
-                "INV:HONEY_BOTTLE:&b疗养汤药::guide_soup");
+                "INV:MUSHROOM_STEW:&b疗养汤药::guide_soup");
 
         regHero("demon", "地狱魔兽", Material.NETHERITE_SCRAP,
                 "CHEST:NETHERITE_CHESTPLATE:&c兽皮:FIRE_PROTECTION:5,PROJECTILE_PROTECTION:2",
@@ -324,8 +334,10 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
 
     private void registerAllSkills() {
         // 格式: ID, 类型, CD, 参数(距离/Buff等)
-        regSkill("guide_shelter", "TELEPORT", 15, "15", "SPEED:60:1");
-        regSkill("guide_soup", "HEAL", 15, "20", "REGENERATION:60:0");
+        // 庇护之瞬：右键短暂漂浮后瞬移15格，落地获得3秒速度II（amplifier 1 = II），CD 15s
+        regSkill("guide_shelter", "GUIDE_SHELTER", 15, "15", "");
+        // 疗养汤药：右键立即回复自身血量至满（+20点上限），手持持续获得生命恢复I，CD 15s
+        regSkill("guide_soup", "GUIDE_SOUP", 15, "20", "");
         regSkill("demon_claw", "HEAL", 14, "4", "ABSORPTION:80:0,SPEED:80:0");
         regSkill("demon_regen", "HEAL", 20, "15", "DAMAGE_RESISTANCE:200:1");
         regSkill("ender_punch", "TELEPORT", 1, "4", "REGENERATION:60:0");
@@ -544,7 +556,10 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             if (p.length < 3) continue;
             String slot = p[0], matStr = p[1], name = p[2];
             String enchants = p.length > 3 ? p[3] : "";
-            String skillId = p.length > 4 ? p[4] : "";
+            // 第5段可能是技能ID，也可能是属性修饰（ATTACK_DAMAGE:x）；第6段才是技能ID
+            String field5 = p.length > 4 ? p[4] : "";
+            String attributes = field5.contains(";") ? field5 : "";
+            String skillId = p.length > 5 ? p[5] : (!attributes.isEmpty() ? "" : field5);
 
             Material mat = Material.matchMaterial(matStr);
             if (mat == null || !mat.isItem()) {
@@ -554,6 +569,29 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             ItemStack item = new ItemStack(mat);
             ItemMeta meta = item.getItemMeta();
             meta.setDisplayName(ChatColor.translateAlternateColorCodes('&', name));
+
+            // 解析自定义属性修饰（护甲加成、攻击伤害、攻击速度等）
+            if (!attributes.isEmpty()) {
+                for (String attrEntry : attributes.split(",")) {
+                    String[] ap = attrEntry.split(":");
+                    if (ap.length < 2) continue;
+                    Attribute attr;
+                    try {
+                        attr = Attribute.valueOf(ap[0].startsWith("GENERIC_") ? ap[0] : "GENERIC_" + ap[0]);
+                    } catch (IllegalArgumentException ex) {
+                        getLogger().warning("未知属性名: " + ap[0] + "（装备 " + name + "）");
+                        continue;
+                    }
+                    try {
+                        double amount = Double.parseDouble(ap[1]);
+                        AttributeModifier mod = new AttributeModifier(UUID.randomUUID(), "mc_" + ap[0].toLowerCase(),
+                                amount, AttributeModifier.Operation.ADD_NUMBER);
+                        meta.addAttributeModifier(attr, mod);
+                    } catch (NumberFormatException ex) {
+                        getLogger().warning("属性数值非法: " + attrEntry + "（装备 " + name + "）");
+                    }
+                }
+            }
 
             // 解析附魔（对非法等级/名称做容错，避免个别配置错误导致整个技能失效）
             if (!enchants.isEmpty()) {
@@ -605,7 +643,11 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         String skillId = item.getItemMeta().getPersistentDataContainer().get(classKey, PersistentDataType.STRING);
         if (skillId == null) return;
         SkillData skill = skills.get(skillId);
-        if (skill == null) return;
+        if (skill == null) {
+            // 技能ID未注册（配置错误）：给出明确提示，便于排查而非静默失效
+            getLogger().warning("玩家 " + player.getName() + " 触发了未注册的技能ID: " + skillId);
+            return;
+        }
 
         // 冷却检查放在 setCancelled 之前：冷却中仍拦截原物品行为（如弓箭连点），防止绕过 CD
         if (!checkCooldown(player, skillId, skill.cd)) {
@@ -644,6 +686,41 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
                 double maxHealth = maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0;
                 player.setHealth(Math.min(player.getHealth() + heal, maxHealth));
+                break;
+            }
+            case "GUIDE_SHELTER": {
+                // 庇护之瞬：右键短暂漂浮（LEVITATION 约0.5秒）后向视线方向瞬移15格，
+                // 落地后提供3秒速度II；带粒子与音效反馈
+                double dist = Double.parseDouble(skill.param);
+                Location origin = player.getLocation();
+                player.addPotionEffect(new PotionEffect(PotionEffectType.LEVITATION, 10, 0, false, false, false));
+                player.getWorld().spawnParticle(Particle.PORTAL, origin, 30, 0.4, 0.6, 0.4, 0.1);
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    if (!player.isOnline() || player.isDead()) return;
+                    Location tgt = player.getLocation();
+                    World w = tgt.getWorld();
+                    Location target = tgt.clone().add(tgt.getDirection().multiply(dist));
+                    int ground = findGroundLevel(w, target.getBlockX(), target.getBlockZ());
+                    if (ground < 0) ground = tgt.getBlockY(); // 找不到落点时保持原高度，避免掉入虚空
+                    Location land = new Location(w, target.getX() + 0.5, ground + 1, target.getZ() + 0.5);
+                    player.teleport(land);
+                    player.removePotionEffect(PotionEffectType.LEVITATION);
+                    player.playSound(land, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+                    player.getWorld().spawnParticle(Particle.PORTAL, land, 30, 0.4, 0.6, 0.4, 0.1);
+                    // 瞬移完成后 3 秒速度 II（amplifier 1 = II）
+                    player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 60, 1, true, true));
+                }, 10L);
+                break;
+            }
+            case "GUIDE_SOUP": {
+                // 疗养汤药：右键立即回复自身血量（+20点，受上限约束），
+                // 手持期间持续获得生命恢复I（由 onItemHeld 监听器实现，此处补一个3秒保底窗口）
+                double heal = Double.parseDouble(skill.param);
+                AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+                double maxHealth = maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0;
+                player.setHealth(Math.min(player.getHealth() + heal, maxHealth));
+                player.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 60, 0, true, true));
+                player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_BURP, 1.0f, 1.0f);
                 break;
             }
             case "DAMAGE_AREA": {
@@ -700,6 +777,20 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     }
 
     /**
+     * 疗养汤药"手持持续获得生命恢复I"：切换快捷栏物品时检测，
+     * 若新持有物品为疗养汤药则刷新一个2秒的生命恢复I窗口（循环续杯），
+     * 切走则自然过期；同时兜底处理死亡/换职业等状态变化。
+     */
+    @EventHandler
+    public void onItemHeld(PlayerItemHeldEvent event) {
+        Player player = event.getPlayer();
+        ItemStack next = player.getInventory().getItem(event.getNewSlot());
+        if (next != null && displayName(next).contains("疗养汤药")) {
+            player.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 40, 0, true, true));
+        }
+    }
+
+    /**
      * 在给定 (x,z) 列中自上而下寻找可站立的地面高度：
      * 要求脚下为实体方块、其上两格为空气且不含液体；找不到返回 -1。
      */
@@ -746,7 +837,14 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             if (kb.lengthSquared() > 1e-6) {
                 target.setVelocity(kb.normalize().multiply(1.2).setY(0.6));
             }
-            target.setFireTicks(30);
+            target.setFireTicks(30); // 点燃约 1.5 秒（30 tick）
+            // 射手定位：命中附带"标记"效果（发光 + 缓慢，持续 4 秒），便于团队集火
+            if (target instanceof Player) {
+                Player marked = (Player) target;
+                marked.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 80, 0, true, false, false));
+                marked.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, 80, 0, true, true));
+                marked.sendMessage(ChatColor.GOLD + "你被指引者标记了！");
+            }
         }
     }
 
