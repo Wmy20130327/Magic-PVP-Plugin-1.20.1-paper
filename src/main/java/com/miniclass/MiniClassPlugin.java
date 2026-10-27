@@ -13,11 +13,14 @@ import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.Vector;
@@ -41,6 +44,8 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     // 内存数据注册表（LinkedHashMap 保持英雄注册顺序，保证 GUI 槽位稳定）
     private final Map<String, HeroData> heroes = new LinkedHashMap<>();
     private final Map<String, SkillData> skills = new HashMap<>();
+    // 玩家职业持久化：重启/换服后仍能自动恢复装备
+    private final Map<UUID, String> playerClassMap = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -59,16 +64,100 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         // 启动时校验：报告引用了未注册技能或材质非法的英雄配置
         validateRegistrations();
 
+        // 加载玩家职业选择记录
+        loadPlayerClasses();
+
         getLogger().info("职业缩小版终极版已加载！共 " + heroes.size() + " 个英雄、"
                 + skills.size() + " 个技能。");
     }
 
     @Override
     public void onDisable() {
-        // 清理运行时状态，避免插件重载后残留冷却/被动记录
+        // 落盘玩家职业记录，再清理运行时状态
+        savePlayerClasses();
         cooldowns.clear();
         passiveCD.clear();
         states.clear();
+    }
+
+    // ================= 玩家职业持久化 =================
+    private void loadPlayerClasses() {
+        FileConfiguration cfg = getConfig();
+        for (String uuid : cfg.getKeys(false)) {
+            String classId = cfg.getString(uuid);
+            if (classId != null && heroes.containsKey(classId)) {
+                try {
+                    playerClassMap.put(UUID.fromString(uuid), classId);
+                } catch (IllegalArgumentException ignored) {
+                    // 非法 UUID 键，跳过
+                }
+            }
+        }
+        if (!playerClassMap.isEmpty()) {
+            getLogger().info("已恢复 " + playerClassMap.size() + " 条玩家职业记录。");
+        }
+    }
+
+    private void savePlayerClasses() {
+        FileConfiguration cfg = getConfig();
+        for (Map.Entry<UUID, String> e : playerClassMap.entrySet()) {
+            cfg.set(e.getKey().toString(), e.getValue());
+        }
+        saveConfig();
+    }
+
+    /** 将玩家当前手持/穿戴物品与所选职业装备比对，判断是否仍持有职业 */
+    private boolean hasHeroGear(Player player, String classId) {
+        HeroData hero = heroes.get(classId);
+        if (hero == null) return false;
+        for (String eq : hero.equipData) {
+            String[] p = eq.split(":");
+            if (p.length < 3) continue;
+            Material mat = Material.matchMaterial(p[1]);
+            if (mat == null) continue;
+            String slot = p[0];
+            ItemStack item;
+            switch (slot) {
+                case "HELMET": item = player.getInventory().getHelmet(); break;
+                case "CHEST":  item = player.getInventory().getChestplate(); break;
+                case "LEGS":   item = player.getInventory().getLeggings(); break;
+                case "BOOTS":  item = player.getInventory().getBoots(); break;
+                default:       item = player.getInventory().getItemInMainHand(); break;
+            }
+            if (item != null && item.getType() == mat) return true;
+        }
+        return false;
+    }
+
+    @EventHandler
+    public void onRespawn(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        String classId = playerClassMap.get(player.getUniqueId());
+        if (classId == null || !heroes.containsKey(classId)) return;
+        // 死亡重生后自动恢复职业装备（下一 tick 执行，确保重生位置/库存已就绪）
+        Bukkit.getScheduler().runTaskLater(this, () -> restoreClass(player, classId), 1L);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        String classId = playerClassMap.get(player.getUniqueId());
+        if (classId == null || !heroes.containsKey(classId)) return;
+        // 重进服务器：若背包里已无该职业装备（如服务器崩溃导致掉落），自动补发
+        if (!hasHeroGear(player, classId)) {
+            Bukkit.getScheduler().runTaskLater(this, () -> restoreClass(player, classId), 20L);
+        }
+    }
+
+    /** 恢复职业装备：不清空背包、不随机传送（与 selectClass 的区别所在） */
+    private void restoreClass(Player player, String classId) {
+        if (!player.isOnline()) return;
+        HeroData hero = heroes.get(classId);
+        if (hero == null) return;
+        giveHeroEquipment(player, hero);
+        AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+        player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
+        player.sendMessage(ChatColor.YELLOW + "已自动恢复职业 [" + hero.name + "] 的装备！");
     }
 
     @Override
@@ -428,8 +517,27 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         player.setFoodLevel(20);
         player.getActivePotionEffects().forEach(e -> player.removePotionEffect(e.getType()));
         states.remove(player.getUniqueId());
+        playerClassMap.put(player.getUniqueId(), classId); // 记录选择，供重生/重启后恢复
         player.sendMessage(ChatColor.YELLOW + "已选择 [" + hero.name + "]！正在发放装备...");
 
+        giveHeroEquipment(player, hero);
+
+        // 随机传送：从最高方块向上找可站立空气位，避免卡进方块或掉入虚空
+        World world = player.getWorld();
+        int x = random.nextInt(2000) - 1000, z = random.nextInt(2000) - 1000;
+        int ground = findGroundLevel(world, x, z);
+        if (ground < 0) {
+            // 该列无合适落点（如深坑），退回玩家当前位置，保证不丢失装备后的传送失败
+            player.sendMessage(ChatColor.RED + "随机传送落点无效，已留在原地。");
+            return;
+        }
+        Location safe = new Location(world, x + 0.5, ground, z + 0.5);
+        player.teleport(safe);
+        player.playSound(safe, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+    }
+
+    /** 解析英雄装备配置并放入玩家背包/装备栏（selectClass 与 restoreClass 共用） */
+    private void giveHeroEquipment(Player player, HeroData hero) {
         // 解析并生成装备
         for (String eq : hero.equipData) {
             String[] p = eq.split(":");
@@ -440,7 +548,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
 
             Material mat = Material.matchMaterial(matStr);
             if (mat == null || !mat.isItem()) {
-                getLogger().warning("英雄 " + classId + " 的装备材质不可用，已跳过: " + matStr);
+                getLogger().warning("英雄的装备材质不可用，已跳过: " + matStr);
                 continue;
             }
             ItemStack item = new ItemStack(mat);
@@ -480,22 +588,9 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 case "OFF": player.getInventory().setItemInOffHand(item); break;
                 case "INV": player.getInventory().addItem(item); break;
                 default:
-                    getLogger().warning("未知装备槽位: " + slot + "（英雄 " + classId + "）");
+                    getLogger().warning("未知装备槽位: " + slot + "（英雄 " + hero.name + "）");
             }
         }
-
-        // 随机传送：从最高方块向上找可站立空气位，避免卡进方块或掉入虚空
-        World world = player.getWorld();
-        int x = random.nextInt(2000) - 1000, z = random.nextInt(2000) - 1000;
-        int ground = findGroundLevel(world, x, z);
-        if (ground < 0) {
-            // 该列无合适落点（如深坑），退回玩家当前位置，保证不丢失装备后的传送失败
-            player.sendMessage(ChatColor.RED + "随机传送落点无效，已留在原地。");
-            return;
-        }
-        Location safe = new Location(world, x + 0.5, ground, z + 0.5);
-        player.teleport(safe);
-        player.playSound(safe, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
     }
 
     // ================= 3. 通用技能执行引擎 =================
