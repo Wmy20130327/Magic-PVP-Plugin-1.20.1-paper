@@ -3,6 +3,7 @@ package com.miniclass;
 import org.bukkit.*;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
+import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
@@ -10,14 +11,20 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.block.Block;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ElytraMeta;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.metadata.FixedMetadataValue;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.Vector;
@@ -33,14 +40,16 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     private NamespacedKey classKey;
     // 使用并发安全的 ConcurrentHashMap，防止未来引入异步逻辑时出现数据竞争
     private final Map<String, Long> cooldowns = new ConcurrentHashMap<>();
+    // 被动技能内置冷却（按玩家 UUID）
     private final Map<UUID, Long> passiveCD = new ConcurrentHashMap<>();
-    private final Map<UUID, String> states = new ConcurrentHashMap<>();
     // 全局共享的随机实例（Random 线程安全），避免频繁 new Random()
     private final Random random = new Random();
 
     // 内存数据注册表（LinkedHashMap 保持英雄注册顺序，保证 GUI 槽位稳定）
     private final Map<String, HeroData> heroes = new LinkedHashMap<>();
     private final Map<String, SkillData> skills = new HashMap<>();
+    // 玩家职业持久化：重启/换服后仍能自动恢复装备
+    private final Map<UUID, String> playerClassMap = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -59,16 +68,99 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         // 启动时校验：报告引用了未注册技能或材质非法的英雄配置
         validateRegistrations();
 
+        // 加载玩家职业选择记录
+        loadPlayerClasses();
+
         getLogger().info("职业缩小版终极版已加载！共 " + heroes.size() + " 个英雄、"
                 + skills.size() + " 个技能。");
     }
 
     @Override
     public void onDisable() {
-        // 清理运行时状态，避免插件重载后残留冷却/被动记录
+        // 落盘玩家职业记录，再清理运行时状态
+        savePlayerClasses();
         cooldowns.clear();
         passiveCD.clear();
-        states.clear();
+    }
+
+    // ================= 玩家职业持久化 =================
+    private void loadPlayerClasses() {
+        FileConfiguration cfg = getConfig();
+        for (String uuid : cfg.getKeys(false)) {
+            String classId = cfg.getString(uuid);
+            if (classId != null && heroes.containsKey(classId)) {
+                try {
+                    playerClassMap.put(UUID.fromString(uuid), classId);
+                } catch (IllegalArgumentException ignored) {
+                    // 非法 UUID 键，跳过
+                }
+            }
+        }
+        if (!playerClassMap.isEmpty()) {
+            getLogger().info("已恢复 " + playerClassMap.size() + " 条玩家职业记录。");
+        }
+    }
+
+    private void savePlayerClasses() {
+        FileConfiguration cfg = getConfig();
+        for (Map.Entry<UUID, String> e : playerClassMap.entrySet()) {
+            cfg.set(e.getKey().toString(), e.getValue());
+        }
+        saveConfig();
+    }
+
+    /** 将玩家当前手持/穿戴物品与所选职业装备比对，判断是否仍持有职业 */
+    private boolean hasHeroGear(Player player, String classId) {
+        HeroData hero = heroes.get(classId);
+        if (hero == null) return false;
+        for (String eq : hero.equipData) {
+            String[] p = eq.split(":");
+            if (p.length < 3) continue;
+            Material mat = Material.matchMaterial(p[1]);
+            if (mat == null) continue;
+            String slot = p[0];
+            ItemStack item;
+            switch (slot) {
+                case "HELMET": item = player.getInventory().getHelmet(); break;
+                case "CHEST":  item = player.getInventory().getChestplate(); break;
+                case "LEGS":   item = player.getInventory().getLeggings(); break;
+                case "BOOTS":  item = player.getInventory().getBoots(); break;
+                default:       item = player.getInventory().getItemInMainHand(); break;
+            }
+            if (item != null && item.getType() == mat) return true;
+        }
+        return false;
+    }
+
+    @EventHandler
+    public void onRespawn(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        String classId = playerClassMap.get(player.getUniqueId());
+        if (classId == null || !heroes.containsKey(classId)) return;
+        // 死亡重生后自动恢复职业装备（下一 tick 执行，确保重生位置/库存已就绪）
+        Bukkit.getScheduler().runTaskLater(this, () -> restoreClass(player, classId), 1L);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        String classId = playerClassMap.get(player.getUniqueId());
+        if (classId == null || !heroes.containsKey(classId)) return;
+        // 重进服务器：若背包里已无该职业装备（如服务器崩溃导致掉落），自动补发
+        if (!hasHeroGear(player, classId)) {
+            Bukkit.getScheduler().runTaskLater(this, () -> restoreClass(player, classId), 20L);
+        }
+    }
+
+    /** 恢复职业装备：不清空背包、不随机传送（与 selectClass 的区别所在） */
+    private void restoreClass(Player player, String classId) {
+        if (!player.isOnline()) return;
+        HeroData hero = heroes.get(classId);
+        if (hero == null) return;
+        giveHeroEquipment(player, hero);
+        AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+        player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
+        player.sendMessage(ChatColor.YELLOW + "已自动恢复职业 [" + hero.name + "] 的装备！");
     }
 
     @Override
@@ -104,12 +196,17 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     private void registerAllHeroes() {
         // 格式: ID, 名称, 图标材质, 装备数据(槽位:材质:名称:附魔:技能ID)
         regHero("guide", "指引者", Material.IRON_HELMET,
-                "HELMET:IRON_HELMET:&e指引战盔:WATER_BREATHING:1",
-                "CHEST:IRON_CHESTPLATE:&e指引战甲:PROJECTILE_PROTECTION:2",
-                "BOOTS:LEATHER_BOOTS:&e指引战靴:FALL_PROTECTION:10",
+                // 头盔：水下呼吸I + 护甲值+3（自定义属性）
+                "HELMET:IRON_HELMET:&e指引战盔:WATER_BREATHING:1|ARMOR:3",
+                // 胸甲：弹射物保护II + 护甲值+3
+                "CHEST:IRON_CHESTPLATE:&e指引战甲:PROJECTILE_PROTECTION:2|ARMOR:3",
+                // 靴子：摔落保护X + 护甲值+1
+                "BOOTS:LEATHER_BOOTS:&e指引战靴:FALL_PROTECTION:10|ARMOR:1",
+                // 主手弓：力量I(ARROW_DAMAGE) + 无限
                 "MAIN:BOW:&6指引天弓:ARROW_DAMAGE:1,ARROW_INFINITE:1",
-                "INV:IRON_SWORD:&c指引匕首:LOOT_BONUS_BLOCKS:1",
-                "INV:ENDER_PEARL:&6庇护之瞬::guide_shelter",
+                // 匕首：攻击伤害+5、攻击速度-2.5（自定义属性）+ 时运I
+                "INV:IRON_SWORD:&c指引匕首:LOOT_BONUS_BLOCKS:1|GENERIC_ATTACK_DAMAGE:5,GENERIC_ATTACK_SPEED:-2.5",
+                "INV:ELYTRA:&6庇护之瞬::guide_shelter",
                 "INV:HONEY_BOTTLE:&b疗养汤药::guide_soup");
 
         regHero("demon", "地狱魔兽", Material.NETHERITE_SCRAP,
@@ -235,8 +332,8 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
 
     private void registerAllSkills() {
         // 格式: ID, 类型, CD, 参数(距离/Buff等)
-        regSkill("guide_shelter", "TELEPORT", 15, "15", "SPEED:60:1");
-        regSkill("guide_soup", "HEAL", 15, "20", "REGENERATION:60:0");
+        regSkill("guide_shelter", "GUIDE_SHIELD", 15, "15", "SPEED:60:1");
+        regSkill("guide_soup", "GUIDE_SOUP", 15, "20", "REGENERATION:60:0");
         regSkill("demon_claw", "HEAL", 14, "4", "ABSORPTION:80:0,SPEED:80:0");
         regSkill("demon_regen", "HEAL", 20, "15", "DAMAGE_RESISTANCE:200:1");
         regSkill("ender_punch", "TELEPORT", 1, "4", "REGENERATION:60:0");
@@ -427,20 +524,49 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
         player.setFoodLevel(20);
         player.getActivePotionEffects().forEach(e -> player.removePotionEffect(e.getType()));
-        states.remove(player.getUniqueId());
+        playerClassMap.put(player.getUniqueId(), classId); // 记录选择，供重生/重启后恢复
         player.sendMessage(ChatColor.YELLOW + "已选择 [" + hero.name + "]！正在发放装备...");
 
+        giveHeroEquipment(player, hero);
+
+        // 随机传送：从最高方块向上找可站立空气位，避免卡进方块或掉入虚空
+        World world = player.getWorld();
+        int x = random.nextInt(2000) - 1000, z = random.nextInt(2000) - 1000;
+        int ground = findGroundLevel(world, x, z);
+        if (ground < 0) {
+            // 该列无合适落点（如深坑），退回玩家当前位置，保证不丢失装备后的传送失败
+            player.sendMessage(ChatColor.RED + "随机传送落点无效，已留在原地。");
+            return;
+        }
+        Location safe = new Location(world, x + 0.5, ground, z + 0.5);
+        player.teleport(safe);
+        player.playSound(safe, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+    }
+
+    /** 解析英雄装备配置并放入玩家背包/装备栏（selectClass 与 restoreClass 共用） */
+    private void giveHeroEquipment(Player player, HeroData hero) {
         // 解析并生成装备
         for (String eq : hero.equipData) {
             String[] p = eq.split(":");
             if (p.length < 3) continue;
             String slot = p[0], matStr = p[1], name = p[2];
-            String enchants = p.length > 3 ? p[3] : "";
+            // 第4段支持 "附魔列表|属性修饰符" 扩展语法，如：
+            //   LOOT_BONUS_BLOCKS:1|GENERIC_ATTACK_DAMAGE:5,GENERIC_ATTACK_SPEED:-2.5
+            String enchantPart = "", attrPart = "";
+            if (p.length > 3) {
+                int bar = p[3].indexOf('|');
+                if (bar >= 0) {
+                    enchantPart = p[3].substring(0, bar);
+                    attrPart = p[3].substring(bar + 1);
+                } else {
+                    enchantPart = p[3];
+                }
+            }
             String skillId = p.length > 4 ? p[4] : "";
 
             Material mat = Material.matchMaterial(matStr);
             if (mat == null || !mat.isItem()) {
-                getLogger().warning("英雄 " + classId + " 的装备材质不可用，已跳过: " + matStr);
+                getLogger().warning("英雄的装备材质不可用，已跳过: " + matStr);
                 continue;
             }
             ItemStack item = new ItemStack(mat);
@@ -448,11 +574,11 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             meta.setDisplayName(ChatColor.translateAlternateColorCodes('&', name));
 
             // 解析附魔（对非法等级/名称做容错，避免个别配置错误导致整个技能失效）
-            if (!enchants.isEmpty()) {
-                for (String enc : enchants.split(",")) {
+            if (!enchantPart.isEmpty()) {
+                for (String enc : enchantPart.split(",")) {
                     String[] ep = enc.split(":");
                     if (ep.length < 2) continue;
-                    Enchantment e = Enchantment.getByName(ep[0]);
+                    Enchantment e = resolveEnchantment(ep[0]);
                     if (e == null) {
                         getLogger().warning("未知附魔名: " + ep[0] + "（装备 " + name + "）");
                         continue;
@@ -464,6 +590,12 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                     }
                 }
             }
+
+            // 解析自定义属性修饰符（护甲值、攻击伤害、攻击速度等，可带槽位前缀 @BASE/@ADDITIONAL）
+            if (!attrPart.isEmpty()) {
+                applyAttributeModifiers(meta, name, attrPart);
+            }
+
             // 写入技能标签
             if (!skillId.isEmpty()) {
                 meta.getPersistentDataContainer().set(classKey, PersistentDataType.STRING, skillId);
@@ -480,23 +612,134 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 case "OFF": player.getInventory().setItemInOffHand(item); break;
                 case "INV": player.getInventory().addItem(item); break;
                 default:
-                    getLogger().warning("未知装备槽位: " + slot + "（英雄 " + classId + "）");
+                    getLogger().warning("未知装备槽位: " + slot + "（英雄 " + hero.name + "）");
             }
         }
-
-        // 随机传送：从最高方块向上找可站立空气位，避免卡进方块或掉入虚空
-        World world = player.getWorld();
-        int x = random.nextInt(2000) - 1000, z = random.nextInt(2000) - 1000;
-        int ground = findGroundLevel(world, x, z);
-        if (ground < 0) {
-            // 该列无合适落点（如深坑），退回玩家当前位置，保证不丢失装备后的传送失败
-            player.sendMessage(ChatColor.RED + "随机传送落点无效，已留在原地。");
-            return;
-        }
-        Location safe = new Location(world, x + 0.5, ground, z + 0.5);
-        player.teleport(safe);
-        player.playSound(safe, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
     }
+
+    /** 特殊标记：物品右键使用后立即进入冷却（用于持续型道具，如鞘翅漂浮） */
+    private static final String CD_ON_CAST = "@CDONCAST";
+
+    /** 兼容旧数据与新版枚举名的附魔解析（getByName 已废弃且对部分新 ID 返回 null） */
+    @SuppressWarnings("deprecation")
+    private Enchantment resolveEnchantment(String name) {
+        Enchantment e = Enchantment.getByName(name);
+        if (e != null) return e;
+        // 回退：按 namespaced key 查找，兼容 DAMAGE_ALL -> minecraft:sharpness 等新旧命名差异
+        for (Enchantment cand : Enchantment.values()) {
+            String key = cand.getKey().getKey();
+            String plain = key.replace("_", "");
+            String n = name.replace("_", "");
+            if (key.equalsIgnoreCase(name) || plain.equalsIgnoreCase(n)) return cand;
+        }
+        return null;
+    }
+
+    /** 药水效果解析，带同样的 namespaced key 回退 */
+    @SuppressWarnings("deprecation")
+    private PotionEffectType resolvePotionEffect(String name) {
+        PotionEffectType t = PotionEffectType.getByName(name);
+        if (t != null) return t;
+        for (PotionEffectType cand : PotionEffectType.values()) {
+            String key = cand.getKey().getKey();
+            String plain = key.replace("_", "");
+            String n = name.replace("_", "");
+            if (key.equalsIgnoreCase(name) || plain.equalsIgnoreCase(n)) return cand;
+        }
+        return null;
+    }
+
+    // ================= 疗养汤药：手持持续回血 =================
+    private final Map<UUID, Long> soupLastTick = new ConcurrentHashMap<>();
+    private int soupTaskId = -1;
+
+    /** 记录玩家刚触发过汤药技能（手持期间获得周期性生命恢复I） */
+    private void startSoupHold(Player player) {
+        soupLastTick.put(player.getUniqueId(), System.currentTimeMillis());
+        if (soupTaskId < 0) {
+            // 每 20 tick 巡检一次手持"疗养汤药"的玩家；重复施放只会刷新时间戳，不会叠加任务
+            soupTaskId = Bukkit.getScheduler().runTaskTimer(this, this::tickSoupHolders, 20L, 20L).getTaskId();
+        }
+    }
+
+    private void tickSoupHolders() {
+        long now = System.currentTimeMillis();
+        Iterator<UUID> it = soupLastTick.keySet().iterator();
+        while (it.hasNext()) {
+            UUID uuid = it.next();
+            Player p = Bukkit.getPlayer(uuid);
+            if (p == null || !p.isOnline() || p.isDead()) {
+                it.remove();
+                continue;
+            }
+            // 手持（主手或副手）疗养汤药时，每 3 秒补充一次 3 秒生命恢复I，形成"持续"效果
+            boolean holding = displayName(p.getInventory().getItemInMainHand()).contains("疗养汤药")
+                    || displayName(p.getInventory().getItemInOffHand()).contains("疗养汤药");
+            if (!holding) {
+                it.remove();
+                continue;
+            }
+            if (now - soupLastTick.get(uuid) >= 3000L) {
+                soupLastTick.put(uuid, now);
+                p.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 60, 0, true, false));
+            }
+        }
+        if (soupLastTick.isEmpty() && soupTaskId >= 0) {
+            Bukkit.getScheduler().cancelTask(soupTaskId);
+            soupTaskId = -1;
+        }
+    }
+
+
+    /**
+     * 解析 "属性名:数值[:运算类型[@槽位]]" 逗号分隔列表，写入 ItemMeta。
+     * 例：ARMOR:3 / GENERIC_ATTACK_DAMAGE:5 / GENERIC_ATTACK_SPEED:-2.5
+     */
+    private void applyAttributeModifiers(ItemMeta meta, String itemName, String attrSpec) {
+        for (String a : attrSpec.split(",")) {
+            String[] ap = a.split(":");
+            if (ap.length < 2) continue;
+            Attribute attr;
+            try {
+                attr = Attribute.valueOf(ap[0].trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException ex) {
+                getLogger().warning("未知属性名: " + ap[0] + "（装备 " + itemName + "）");
+                continue;
+            }
+            double value;
+            try {
+                value = Double.parseDouble(ap[1].trim());
+            } catch (NumberFormatException ex) {
+                getLogger().warning("属性数值非法: " + a + "（装备 " + itemName + "）");
+                continue;
+            }
+            AttributeModifier.Operation op = AttributeModifier.Operation.ADD_NUMBER;
+            EquipmentSlot hand = EquipmentSlot.HAND;
+            if (ap.length >= 3) {
+                try {
+                    op = AttributeModifier.Operation.valueOf(ap[2].trim().toUpperCase(Locale.ROOT));
+                } catch (IllegalArgumentException ex) {
+                    getLogger().warning("属性运算类型非法: " + ap[2] + "（装备 " + itemName + "），按 ADD_NUMBER 处理");
+                }
+            }
+            if (ap.length >= 4) {
+                try {
+                    hand = EquipmentSlot.valueOf(ap[3].trim().toUpperCase(Locale.ROOT));
+                } catch (IllegalArgumentException ex) {
+                    getLogger().warning("属性槽位非法: " + ap[3] + "（装备 " + itemName + "），按 HAND 处理");
+                }
+            }
+            // 唯一 UUID：同一装备重复发放时先移除旧的同名修饰符，避免叠加
+            for (AttributeModifier old : meta.getAttributeModifiers(attr)) {
+                if (itemName.equals(old.getName())) {
+                    meta.removeAttributeModifier(attr, old);
+                    break;
+                }
+            }
+            meta.addAttributeModifier(attr, new AttributeModifier(itemName, value, op, hand));
+        }
+    }
+
 
     // ================= 3. 通用技能执行引擎 =================
     @EventHandler
@@ -517,21 +760,63 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             event.setCancelled(true);
             return;
         }
+        // 未附加 @CDONCAST 的技能在释放瞬间即进入冷却；
+        // GUIDE_SHIELD 的后续 buff 由延迟任务自行施加，避免重复
+        boolean deferredBuffs = "GUIDE_SHIELD".equals(skill.type);
+        if (!skill.buffs.contains(CD_ON_CAST) && !deferredBuffs) {
+            applyBuffs(player, skill.buffs);
+        }
         event.setCancelled(true);
 
         try {
-            executeSkill(player, skill);
+            executeSkill(player, skill, item);
         } catch (RuntimeException ex) {
             // 单个技能数据异常不应导致监听器报错刷屏，记录日志便于修正配置
             getLogger().warning("技能 " + skillId + "（类型 " + skill.type + "，参数 " + skill.param + "）执行失败: " + ex.getMessage());
         }
-
-        applyBuffs(player, skill.buffs);
     }
 
-    /** 技能效果分发；返回是否成功释放 */
-    private void executeSkill(Player player, SkillData skill) {
+    /** 技能效果分发；item 为触发技能的物品（供 GUIDE_SHIELD 等需要改写物品的技能使用） */
+    private void executeSkill(Player player, SkillData skill, ItemStack triggerItem) {
         switch (skill.type) {
+            case "GUIDE_SHIELD": {
+                // 庇护之瞬：右键鞘翅短暂漂浮(约1.2s) -> 沿视线至多15格安全落点瞬移 -> 3秒速度II
+                double dist = Double.parseDouble(skill.param);
+                Location origin = player.getLocation();
+                Location target = origin.clone().add(origin.getDirection().multiply(dist));
+                World w = target.getWorld();
+                int ground = findGroundLevel(w, target.getBlockX(), target.getBlockZ());
+                if (ground < 0) ground = origin.getBlockY(); // 找不到落点时保持原高度
+                final Location land = new Location(w, target.getX() + 0.5, ground + 1, target.getZ() + 0.5);
+                // 鞘翅进入冷却期不可展开，避免玩家在漂浮期间二次飞行；到期自动恢复
+                if (triggerItem != null && triggerItem.getItemMeta() instanceof ElytraMeta) {
+                    ElytraMeta em = (ElytraMeta) triggerItem.getItemMeta();
+                    em.setUnbreakable(true);
+                    em.setCooldown(Math.max(skill.cd * 20 + 60, 400));
+                    triggerItem.setItemMeta(em);
+                }
+                player.playSound(origin, Sound.ITEM_ELYTRA_FLYING, 1.0f, 1.4f);
+                player.addPotionEffect(new PotionEffect(PotionEffectType.LEVITATION, 24, 0, true, false));
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    if (!player.isOnline() || player.isDead()) return;
+                    player.setVelocity(new Vector(0, 0, 0));
+                    player.teleport(land);
+                    player.playSound(land, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+                    // 瞬移完成后提供 3 秒速度II（buffs 中的 SPEED:60:1）
+                    applyBuffs(player, skill.buffs);
+                }, 28L);
+                break;
+            }
+            case "GUIDE_SOUP": {
+                // 疗养汤药：右键立即回复 param 点血量；手持期间每 3 秒获得 3 秒生命恢复I
+                double heal = Double.parseDouble(skill.param);
+                AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+                double maxHealth = maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0;
+                player.setHealth(Math.min(player.getHealth() + heal, maxHealth));
+                player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.8f, 1.8f);
+                startSoupHold(player);
+                break;
+            }
             case "TELEPORT": {
                 double dist = Double.parseDouble(skill.param);
                 Location origin = player.getLocation();
@@ -555,7 +840,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 double dmg = Double.parseDouble(skill.param);
                 int range = dmg > 5 ? 5 : 3; // 简单范围推断
                 Location origin = player.getLocation();
-                for (Entity e : player.getNearbyEntities(range, range, range)) {
+                for (Entity e : player.getWorld().getNearbyEntities(origin, range, range, range)) {
                     if (e instanceof LivingEntity && e != player) {
                         ((LivingEntity) e).damage(dmg, player);
                         if (dmg > 4) {
@@ -589,7 +874,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         for (String b : buffs.split(",")) {
             String[] bp = b.split(":");
             if (bp.length < 3) continue;
-            PotionEffectType type = PotionEffectType.getByName(bp[0]);
+            PotionEffectType type = resolvePotionEffect(bp[0]);
             if (type == null) {
                 getLogger().warning("未知药水效果: " + bp[0]);
                 continue;
@@ -637,10 +922,17 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         Arrow arrow = (Arrow) event.getEntity();
         if (!(arrow.getShooter() instanceof Player)) return;
         Player shooter = (Player) arrow.getShooter();
+
+        // 天弓无限附魔：箭矢命中实体/方块后回收到背包（避免无限箭仍消耗库存）
+        if (displayName(shooter.getInventory().getItemInMainHand()).contains("指引天弓")
+                || arrow.hasMetadata("guide_infinite")) {
+            recoverArrow(shooter);
+        }
+
         if (!(event.getHitEntity() instanceof LivingEntity)) return;
         LivingEntity target = (LivingEntity) event.getHitEntity();
 
-        // 指引者被动：天弓命中击退 + 点燃（1.5s 内置冷却）
+        // 指引者被动：天弓命中强制击退 + 点燃约1.5s（1.5s 内置冷却）
         if (displayName(shooter.getInventory().getItemInMainHand()).contains("指引天弓")) {
             UUID uuid = shooter.getUniqueId();
             long now = System.currentTimeMillis();
@@ -652,6 +944,26 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 target.setVelocity(kb.normalize().multiply(1.2).setY(0.6));
             }
             target.setFireTicks(30);
+        }
+    }
+
+    /** 将回收的箭矢放入背包；背包已满则掉落在玩家脚下 */
+    private void recoverArrow(Player player) {
+        ItemStack arrowStack = new ItemStack(Material.ARROW, 1);
+        Map<Integer, ItemStack> leftover = player.getInventory().addItem(arrowStack);
+        for (ItemStack drop : leftover.values()) {
+            player.getWorld().dropItemNaturally(player.getLocation(), drop);
+        }
+    }
+
+    /** 射击时给天弓射出的箭打标记，保证即使切手也能回收 */
+    @EventHandler
+    public void onShoot(EntityShootBowEvent event) {
+        if (!(event.getEntity() instanceof Player)) return;
+        String bowName = displayName(event.getBow());
+        if (bowName.contains("指引天弓") && event.getProjectile() instanceof Arrow) {
+            event.getProjectile().setMetadata("guide_infinite",
+                    new FixedMetadataValue(this, true));
         }
     }
 
