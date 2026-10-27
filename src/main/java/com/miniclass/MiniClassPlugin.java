@@ -12,6 +12,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.block.Block;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -49,6 +50,22 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     private final Map<String, SkillData> skills = new HashMap<>();
     // 玩家职业持久化：重启/换服后仍能自动恢复装备
     private final Map<UUID, String> playerClassMap = new ConcurrentHashMap<>();
+
+    // ================= 地狱魔兽（demon）运行时状态 =================
+    /** 返祖形态玩家集合（不在集合中 = 初始形态） */
+    private final Set<UUID> demonAtavism = ConcurrentHashMap.newKeySet();
+    /** 兽护/兽怒增益到期时间戳（毫秒） */
+    private final Map<UUID, Long> demonBuffEnd = new ConcurrentHashMap<>();
+    /** 兽爪命中刷新增益的内置CD（每玩家1秒最多刷新一次，防高频触发） */
+    private final Map<UUID, Long> demonClawRefresh = new ConcurrentHashMap<>();
+    /** 蓄力冲刺进行中：下一次近战命中改为结算随机冲刺伤害 */
+    private final Set<UUID> demonDashActive = ConcurrentHashMap.newKeySet();
+    /** 【兽怒】易伤状态到期时间戳（毫秒），期间受到伤害+60% */
+    private final Map<UUID, Long> demonVulnEnd = new ConcurrentHashMap<>();
+    /** 永久生命提升V修饰符（固定UUID，便于幂等添加与移除） */
+    private static final UUID HEALTH_BOOST_DEMON = UUID.fromString("a7d3f2c1-5b8e-4a2d-9c6f-1e0d3a5b7c9f");
+    /** 返祖形态武器名称标记（用于识别当前形态发放的兽爪） */
+    private static final String DEMON_CLAW_ATV_NAME = "\u00a7c\u00a7l\u517D\u722A\u00b7\u8fd4\u7956"; // §c§l兽爪·返祖
 
     @Override
     public void onEnable() {
@@ -158,6 +175,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         HeroData hero = heroes.get(classId);
         if (hero == null) return;
         giveHeroEquipment(player, hero);
+        if ("demon".equals(classId)) applyDemonPassives(player); // 死亡/重连恢复时同样补上被动增益
         AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
         player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
         player.sendMessage(ChatColor.YELLOW + "已自动恢复职业 [" + hero.name + "] 的装备！");
@@ -211,10 +229,15 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 "INV:ENDER_PEARL:&6庇护之瞬::guide_shelter",
                 "INV:MUSHROOM_STEW:&b疗养汤药::guide_soup");
 
+        // 地狱魔兽（基础战士）：四件兽皮带火焰保护V；默认/返祖双形态，切换时按形态重新发放装备
+        // （见 demon_transform 技能与 giveHeroEquipment 中的恶魔装备定制分支）
         regHero("demon", "地狱魔兽", Material.NETHERITE_SCRAP,
-                "CHEST:NETHERITE_CHESTPLATE:&c兽皮:FIRE_PROTECTION:5,PROJECTILE_PROTECTION:2",
-                "MAIN:IRON_AXE:&c兽爪:DAMAGE_ALL:2:demon_claw",
-                "INV:GOLDEN_APPLE:&c兽之再生::demon_regen",
+                "HELMET:LEATHER_HELMET:&c兽皮:FIRE_PROTECTION:5:ARMOR;1",
+                "CHEST:LEATHER_CHESTPLATE:&c兽皮:FIRE_PROTECTION:5,PROJECTILE_PROTECTION:2,PROTECTION:1:ARMOR;3",
+                "LEGS:LEATHER_LEGGINGS:&c兽皮:FIRE_PROTECTION:5,PROJECTILE_PROTECTION:2,PROTECTION_EXPLOSIONS:2,PROTECTION:1:ARMOR;2",
+                "BOOTS:LEATHER_BOOTS:&c兽皮:FIRE_PROTECTION:5:ARMOR;1",
+                "MAIN:GOLDEN_AXE:&c兽爪:DAMAGE_ALL:2.5:demon_claw",
+                "INV:COOKED_BEEF:&c兽之再生::demon_regen",
                 "INV:RED_DYE:&c兽欲返祖::demon_transform");
 
         regHero("enderman", "末影使者", Material.CARVED_PUMPKIN,
@@ -338,8 +361,10 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         regSkill("guide_shelter", "GUIDE_SHELTER", 15, "15", "");
         // 疗养汤药：右键立即回复自身血量至满（+20点上限），手持持续获得生命恢复I，CD 15s
         regSkill("guide_soup", "GUIDE_SOUP", 15, "20", "");
-        regSkill("demon_claw", "HEAL", 14, "4", "ABSORPTION:80:0,SPEED:80:0");
-        regSkill("demon_regen", "HEAL", 20, "15", "DAMAGE_RESISTANCE:200:1");
+        // 地狱魔兽技能（右键触发，CD 由引擎统一处理；具体形态分支见 executeSkill 定制 case）
+        regSkill("demon_claw", "DEMON_CLAW", 14, "0", "");       // 兽护/兽怒：右键自增益+回血
+        regSkill("demon_regen", "DEMON_REGEN", 20, "0", "");      // 默认回15血+抗性II/吸收I；返祖蓄力冲刺
+        regSkill("demon_transform", "DEMON_TRANSFORM", 8, "0", ""); // 兽欲返祖：形态切换（不重置其他技能CD）
         regSkill("ender_punch", "TELEPORT", 1, "4", "REGENERATION:60:0");
         regSkill("ghost_dagger", "BUFF", 6, "0", "SPEED:80:0,REGENERATION:80:1");
         regSkill("ghost_dance", "TELEPORT", 0, "4", "INVISIBILITY:200:0");
@@ -523,6 +548,11 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
 
         player.getInventory().clear();
         player.getInventory().setArmorContents(null);
+        // 切换职业时清理地狱魔兽被动状态（永久生命提升等），防止叠加残留
+        removeDemonHealthBoost(player);
+        demonAtavism.remove(player.getUniqueId());
+        demonBuffEnd.remove(player.getUniqueId());
+        demonVulnEnd.remove(player.getUniqueId());
         // 按玩家实际最大血量/饥饿值重置，而非硬编码 20
         AttributeInstance maxHealthAttr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
         player.setHealth(maxHealthAttr != null ? maxHealthAttr.getValue() : 20.0);
@@ -533,6 +563,7 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         player.sendMessage(ChatColor.YELLOW + "已选择 [" + hero.name + "]！正在发放装备...");
 
         giveHeroEquipment(player, hero);
+        if ("demon".equals(classId)) applyDemonPassives(player); // 进场被动：伤害吸收II + 永久生命提升V
 
         // 随机传送：从最高方块向上找可站立空气位，避免卡进方块或掉入虚空
         World world = player.getWorld();
@@ -614,6 +645,10 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
             if (!skillId.isEmpty()) {
                 meta.getPersistentDataContainer().set(classKey, PersistentDataType.STRING, skillId);
             }
+            // 地狱魔兽装备定制：按玩家当前形态调整数值/附魔（返祖时覆盖默认注册表数值）
+            if (isDemonEquip(name)) {
+                customizeDemonItem(player, name, item, meta);
+            }
             item.setItemMeta(meta);
 
             // 装备到对应槽位
@@ -669,6 +704,15 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
     /** 技能效果分发；返回是否成功释放 */
     private void executeSkill(Player player, SkillData skill) {
         switch (skill.type) {
+            case "DEMON_CLAW":
+                demonClaw(player);
+                break;
+            case "DEMON_REGEN":
+                demonRegen(player);
+                break;
+            case "DEMON_TRANSFORM":
+                demonTransform(player);
+                break;
             case "TELEPORT": {
                 double dist = Double.parseDouble(skill.param);
                 Location origin = player.getLocation();
@@ -752,6 +796,291 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
                 break;
             default:
                 getLogger().warning("未知技能类型: " + skill.type);
+        }
+    }
+
+    // ================= 地狱魔兽（demon）专属逻辑 =================
+
+    /** 判断装备显示名是否属于地狱魔兽的定制品（兽皮/兽爪） */
+    private static boolean isDemonEquip(String plainName) {
+        return plainName != null && (plainName.contains("\u517D\u76AE") || plainName.contains("\u517D\u722A")); // 兽皮 / 兽爪
+    }
+
+    /**
+     * 按玩家当前形态定制地狱魔兽装备：
+     * - 返祖兽皮胸甲：火焰保护V、保护I、+3护甲（去掉弹射物保护II）
+     * - 返祖兽腿：火焰保护V、爆炸保护II、保护I、+2护甲（去掉弹射物保护II）
+     * - 返祖兽爪：攻击伤害+3.5，名称改为"兽爪·返祖"（供战斗监听识别形态）
+     */
+    private void customizeDemonItem(Player player, String name, ItemStack item, ItemMeta meta) {
+        if (!demonAtavism.contains(player.getUniqueId())) return; // 初始形态直接使用注册表默认值
+        if (name.contains("\u517D\u76AE")) { // 兽皮
+            if (item.getType() == Material.LEATHER_CHESTPLATE) {
+                meta.removeEnchant(Enchantment.PROTECTION_PROJECTILE);
+            } else if (item.getType() == Material.LEATHER_LEGGINGS) {
+                meta.removeEnchant(Enchantment.PROTECTION_PROJECTILE);
+            }
+        } else if (name.contains("\u517D\u722A")) { // 兽爪
+            for (AttributeModifier mod : new ArrayList<>(meta.getAttributeModifiers(Attribute.GENERIC_ATTACK_DAMAGE))) {
+                meta.removeAttributeModifier(Attribute.GENERIC_ATTACK_DAMAGE, mod);
+            }
+            meta.addAttributeModifier(Attribute.GENERIC_ATTACK_DAMAGE,
+                    new AttributeModifier(UUID.randomUUID(), "mc_attack_damage", 3.5, AttributeModifier.Operation.ADD_NUMBER));
+            meta.setDisplayName(DEMON_CLAW_ATV_NAME);
+        }
+        item.setItemMeta(meta);
+    }
+
+    /** 兽爪右键：初始=【兽护】(发光I/迅捷I/生命恢复II 4s)+回4血；返祖=【兽怒】(自身易损5s+发光/迅捷III/力量I 4s) */
+    private void demonClaw(Player player) {
+        UUID uuid = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        healPlayer(player, 4);
+        if (demonAtavism.contains(uuid)) {
+            // 返祖：兽怒——自身获得5秒易伤（受到伤害+60%），期间发光/迅捷III/力量I
+            applyDemonVulnerable(uuid, 100); // 易伤窗口覆盖兽怒全程并略留余量
+            player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 80, 0, true, true));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 80, 2, true, true));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.INCREASE_DAMAGE, 80, 0, true, true));
+            demonBuffEnd.put(uuid, now + 4000L);
+            player.sendMessage(ChatColor.DARK_RED + "\u517D\u6012\uff01\u4f64\u8eab\u7684\u91ce\u517d\u672c\u80fd\u82cf\u9192\u4e86\uff01"); // 兽怒！你自身的野兽本能苏醒了！
+        } else {
+            // 初始：兽护——发光I/迅捷I/生命恢复II 持续4s
+            player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 80, 0, true, true));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 80, 0, true, true));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 80, 1, true, true));
+            demonBuffEnd.put(uuid, now + 4000L);
+            player.sendMessage(ChatColor.GREEN + "\u83b7\u5f97\u3010\u517D\u62a4\u3011\uff0c4\u79d2\u5185\u7528\u517D\u722A\u547d\u4e2d\u53ef\u5237\u65b0\u5e76\u56de\u8840\uff01"); // 获得【兽护】
+        }
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_BURP, 1.0f, 0.8f);
+    }
+
+    /** 兽之再生：初始=回15滴血+10s抗性II+15s伤害吸收I；返祖=下潜定身蓄力2s后直线冲刺至多14格 */
+    private void demonRegen(Player player) {
+        UUID uuid = player.getUniqueId();
+        if (demonAtavism.contains(uuid)) {
+            startDemonDash(player);
+            return;
+        }
+        healPlayer(player, 15);
+        player.addPotionEffect(new PotionEffect(PotionEffectType.DAMAGE_RESISTANCE, 200, 1, true, true));  // 10s 抗性II
+        player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 300, 0, true, true));          // 15s 吸收I
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1.0f, 0.8f);
+        player.sendMessage(ChatColor.GREEN + "\u517D\u4e4b\u518d\u751f\uff1a\u6062\u590d15\u70b9\u751f\u547d\uff01");
+    }
+
+    /**
+     * 返祖·兽之再生：快速下降一格并原地定身蓄力2s（期间对附近小范围单位持续造成2点伤害，
+     * 自身获得抗性提升II），蓄力结束朝面向直线冲刺至多14格，点燃冲撞单位并随机造成6/4/2点伤害。
+     */
+    private void startDemonDash(Player player) {
+        UUID uuid = player.getUniqueId();
+        Location start = player.getLocation().clone();
+        // 快速下降一格（带安全校验，防止卡进方块）
+        Location down = start.clone().add(0, -1, 0);
+        Block landing = down.getBlock();
+        if (!landing.isPassable() && !landing.getType().isAir()) {
+            down = start.clone();
+        }
+        player.teleport(down);
+        player.addPotionEffect(new PotionEffect(PotionEffectType.DAMAGE_RESISTANCE, 100, 1, true, true)); // 蓄力期抗性II
+        player.getWorld().spawnParticle(Particle.SMOKE_NORMAL, player.getLocation(), 40, 0.8, 0.3, 0.8, 0.05);
+        player.playSound(player.getLocation(), Sound.ENTITY_GENERIC_EXPLODE, 0.6f, 1.5f);
+        player.setVelocity(new Vector(0, 0.05, 0)); // 轻微上浮抵消坠落感，视觉上"定身"
+        final Location chargeLoc = player.getLocation().clone();
+        // 蓄力2秒：每10tick对小范围(2.5格)敌人造成2点伤害；40tick后自动停止（与冲刺同时结束）
+        final int[] chargeTicks = {0};
+        Bukkit.getScheduler().runTaskTimer(this, task -> {
+            if (!player.isOnline() || player.isDead() || chargeTicks[0]++ >= 4) { task.cancel(); return; }
+            for (Entity e : player.getNearbyEntities(2.5, 2.5, 2.5)) {
+                if (e instanceof LivingEntity && !(e instanceof Player && ((Player) e).getGameMode() == GameMode.CREATIVE)) {
+                    ((LivingEntity) e).damage(2.0, player);
+                }
+            }
+            player.getWorld().spawnParticle(Particle.ENCHANTMENT_TABLE, player.getLocation(), 20, 0.6, 0.8, 0.6, 0.1);
+        }, 0L, 10L);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline() || player.isDead()) return;
+            // 冲刺：沿蓄力开始时的面向逐格推进，命中实体则停下结算
+            Vector dir = chargeLoc.getDirection();
+            if (dir.getX() == 0 && dir.getZ() == 0) dir = chargeLoc.getDirection().setY(0); // 纯俯视时取水平分量
+            if (dir.setX(0).lengthSquared() < 1e-6) dir = new Vector(0, 0, 1);
+            dir.setY(0).normalize();
+            demonDashActive.add(uuid);
+            Location dashFrom = player.getLocation().clone();
+            boolean hitSomething = false;
+            for (int step = 1; step <= 14; step++) {
+                Location probe = dashFrom.clone().add(dir.clone().multiply(step));
+                Entity hit = null;
+                for (Entity e : getEntitiesNear(probe.getWorld(), probe, 1.2)) {
+                    if (e instanceof LivingEntity && e != player) { hit = e; break; }
+                }
+                if (hit != null) {
+                    player.teleport(probe.clone().subtract(dir.clone().multiply(0.5)));
+                    settleDemonDashHit(player, (LivingEntity) hit);
+                    hitSomething = true;
+                    break;
+                }
+            }
+            if (!hitSomething) {
+                Location end = dashFrom.clone().add(dir.clone().multiply(14));
+                int ground = findGroundLevel(end.getWorld(), end.getBlockX(), end.getBlockZ());
+                if (ground >= 0) end.setY(Math.max(ground, dashFrom.getBlockY()));
+                player.teleport(end);
+                Bukkit.getScheduler().runTaskLater(MiniClassPlugin.this, () -> demonDashActive.remove(uuid), 10L);
+            }
+            player.getWorld().spawnParticle(Particle.SMOKE_NORMAL, player.getLocation(), 25, 0.3, 0.3, 0.3, 0.05);
+        }, 40L);
+    }
+
+    /** 查询以 loc 为中心 radius 范围内的实体（跨世界安全） */
+    private List<Entity> getEntitiesNear(World world, Location loc, double radius) {
+        List<Entity> out = new ArrayList<>();
+        for (Entity e : world.getNearbyEntities(loc, radius, radius, radius)) {
+            out.add(e);
+        }
+        return out;
+    }
+
+    /** 冲刺命中结算：点燃目标 + 随机 6/4/2 点伤害（由 onEntityDamage 拦截首击完成） */
+    private void settleDemonDashHit(Player player, LivingEntity target) {
+        UUID uuid = player.getUniqueId();
+        demonDashActive.remove(uuid);
+        target.setFireTicks(40);
+        int[] pool = {6, 4, 2};
+        double dmg = pool[random.nextInt(pool.length)];
+        target.damage(dmg, player);
+        Vector kb = target.getLocation().toVector().subtract(player.getLocation().toVector());
+        if (kb.lengthSquared() > 1e-6) {
+            target.setVelocity(kb.normalize().multiply(1.5).setY(0.5));
+        }
+        player.getWorld().spawnParticle(Particle.EXPLOSION_NORMAL, target.getLocation(), 6, 0.3, 0.3, 0.3, 0.05);
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_ATTACK_CRIT, 1.0f, 0.7f);
+    }
+
+    /** 兽欲返祖：切换形态，重新发放武器/防具（不重置其他技能CD），两种形态均回2血 */
+    private void demonTransform(Player player) {
+        UUID uuid = player.getUniqueId();
+        boolean toAtavism = !demonAtavism.contains(uuid);
+        if (toAtavism) demonAtavism.add(uuid); else demonAtavism.remove(uuid);
+        healPlayer(player, 2);
+        HeroData hero = heroes.get("demon");
+        if (hero != null) giveHeroEquipment(player, hero); // 覆盖式发放对应形态装备
+        if (toAtavism) {
+            player.sendMessage(ChatColor.DARK_RED + "\u8fdb\u5165\u8fd4\u7956\u5f62\u6001\uff01\u517D\u722A\u4f24\u5bb3\u63d0\u5347\uff0c\u517D\u4e4b\u518d\u751f\u53d8\u4e3a\u84c4\u529b\u51b2\u523a\uff01");
+        } else {
+            // 切回初始：获得伤害吸收II（8点黄血）
+            player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 200, 1, true, true));
+            player.sendMessage(ChatColor.GREEN + "\u56de\u5230\u521d\u59cb\u5f62\u6001\uff0c\u83b7\u5f97\u4f24\u5bb3\u5438\u6536 II\uff01");
+        }
+        player.playSound(player.getLocation(), Sound.ENTITY_WOLF_GROWL, 1.2f, 0.6f);
+        player.getWorld().spawnParticle(Particle.SMOKE_LARGE, player.getLocation(), 30, 0.5, 0.8, 0.5, 0.05);
+    }
+
+    /** 回血（受最大血量上限约束） */
+    private void healPlayer(Player player, double amount) {
+        AttributeInstance attr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+        double max = attr != null ? attr.getValue() : 20.0;
+        player.setHealth(Math.min(player.getHealth() + amount, max));
+    }
+
+    /** 幂等添加永久生命提升V（+10红心上限）；1.20.1 API 使用 getName() 标识修饰符 */
+    private void ensureDemonHealthBoost(Player player) {
+        AttributeInstance attr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+        if (attr == null) return;
+        for (AttributeModifier m : attr.getModifiers()) {
+            if ("demon_health_boost".equals(m.getName())) return; // 已存在，避免重复叠加
+        }
+        attr.addModifier(new AttributeModifier(HEALTH_BOOST_DEMON, "demon_health_boost", 10.0,
+                AttributeModifier.Operation.ADD_NUMBER));
+    }
+
+    private void removeDemonHealthBoost(Player player) {
+        AttributeInstance attr = player.getAttribute(Attribute.GENERIC_MAX_HEALTH);
+        if (attr == null) return;
+        for (AttributeModifier m : attr.getModifiers()) {
+            if ("demon_health_boost".equals(m.getName())) { attr.removeModifier(m); return; }
+        }
+    }
+
+    // ---- 返祖【兽怒】易伤（受伤+60%）状态管理 ----
+    private void applyDemonVulnerable(UUID uuid, int ticks) {
+        demonVulnEnd.put(uuid, System.currentTimeMillis() + ticks * 50L);
+    }
+
+    private boolean isDemonVulnerable(UUID uuid) {
+        Long end = demonVulnEnd.get(uuid);
+        if (end == null) return false;
+        if (System.currentTimeMillis() > end) { demonVulnEnd.remove(uuid); return false; }
+        return true;
+    }
+
+    /** 进场被动：伤害吸收II（8点黄血）+ 永久生命提升V（+10红心，通过属性修饰符实现） */
+    private void applyDemonPassives(Player player) {
+        player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 200, 1, true, true));
+        ensureDemonHealthBoost(player);
+    }
+
+    /** 玩家死亡时移除永久生命提升修饰符，防止跨职业/重生后残留 */
+    @EventHandler
+    public void onDeath(org.bukkit.event.entity.PlayerDeathEvent event) {
+        removeDemonHealthBoost(event.getEntity());
+        demonBuffEnd.remove(event.getEntity().getUniqueId());
+        demonVulnEnd.remove(event.getEntity().getUniqueId());
+        demonDashActive.remove(event.getEntity().getUniqueId());
+    }
+
+    /**
+     * 地狱魔兽被动：火焰燃烧时间 x2.5（原版烧地岩浆同样生效）。
+     * 通过持续补充火tick实现：玩家着火期间每tick把剩余火烧延长至基准的2.5倍。
+     */
+    @EventHandler
+    public void onDemonFire(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Player)) return;
+        if (event.getCause() != EntityDamageEvent.DamageCause.FIRE
+                && event.getCause() != EntityDamageEvent.DamageCause.FIRE_TICK
+                && event.getCause() != EntityDamageEvent.DamageCause.LAVA) return;
+        Player p = (Player) event.getEntity();
+        if (!"demon".equals(playerClassMap.get(p.getUniqueId()))) return;
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (p.isOnline() && !p.isDead() && p.getFireTicks() > 0) {
+                p.setFireTicks((int) (p.getFireTicks() * 2.5));
+            }
+        }, 1L);
+    }
+
+    /** 地狱魔兽被动：30%爆炸击退抗性（在击退生效后按反方向抵消30%速度） */
+    @EventHandler(ignoreCancelled = true)
+    public void onDemonExplosionKB(EntityDamageByEntityEvent event) {
+        if (!(event.getEntity() instanceof Player)) return;
+        if (!(event.getDamager() instanceof Creeper) && !(event.getDamager() instanceof TNTPrimed)) return;
+        Player p = (Player) event.getEntity();
+        if (!"demon".equals(playerClassMap.get(p.getUniqueId()))) return;
+        Vector v = p.getVelocity();
+        p.setVelocity(v.multiply(0.7));
+    }
+
+    /**
+     * 地狱魔兽·兽爪战斗被动：
+     * - 1.35 暴击倍率（返祖形态下由冲刺结算外的普攻也享受；此处对两形态统一按设定实现于返祖）
+     * - 初始形态：4s【兽护】窗口内命中 → 刷新3s并回4血
+     * - 返祖形态：4s【兽怒】窗口内命中 → 短暂点燃目标并刷新3s
+     */
+    private void handleDemonClawHit(Player player, LivingEntity target) {
+        UUID uuid = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        Long buffEnd = demonBuffEnd.get(uuid);
+        boolean inBuff = buffEnd != null && now < buffEnd;
+        // 内置刷新CD：1秒内不重复刷新，防止多段伤害高频触发
+        Long last = demonClawRefresh.get(uuid);
+        if (last != null && now - last < 1000) return;
+        if (!inBuff) return;
+        demonClawRefresh.put(uuid, now);
+        demonBuffEnd.put(uuid, now + 3000L); // 刷新3秒持续时间
+        if (demonAtavism.contains(uuid)) {
+            target.setFireTicks(Math.max(target.getFireTicks(), 20)); // 短暂点燃约1秒
+        } else {
+            healPlayer(player, 4); // 兽护命中回血
         }
     }
 
@@ -848,13 +1177,35 @@ public class MiniClassPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    @EventHandler
+    @EventHandler(ignoreCancelled = true)
     public void onEntityDamage(EntityDamageByEntityEvent event) {
+        // 地狱魔兽·返祖【兽怒】易伤：自身作为受击方且处于易伤窗口时，受到伤害+60%
+        if (event.getEntity() instanceof Player) {
+            Player victim = (Player) event.getEntity();
+            if ("demon".equals(playerClassMap.get(victim.getUniqueId())) && isDemonVulnerable(victim.getUniqueId())) {
+                event.setDamage(event.getDamage() * 1.6);
+            }
+        }
+
         if (!(event.getDamager() instanceof Player)) return;
         if (!(event.getEntity() instanceof LivingEntity)) return;
         Player player = (Player) event.getDamager();
         LivingEntity target = (LivingEntity) event.getEntity();
         String weaponName = displayName(player.getInventory().getItemInMainHand());
+
+        // 地狱魔兽·兽爪（武器本身带技能标签，显示名可能为空/返祖名）：按PDC识别，不依赖名称
+        ItemStack held = player.getInventory().getItemInMainHand();
+        String heldSkill = held.hasItemMeta() && held.getItemMeta().getPersistentDataContainer().has(classKey, PersistentDataType.STRING)
+                ? held.getItemMeta().getPersistentDataContainer().get(classKey, PersistentDataType.STRING) : "";
+        if ("demon_claw".equals(heldSkill)) {
+            // 返祖形态：1.35 暴击倍率
+            if (demonAtavism.contains(player.getUniqueId())) {
+                event.setDamage(event.getDamage() * 1.35);
+            }
+            handleDemonClawHit(player, target);
+            return;
+        }
+
         if (weaponName.isEmpty()) return;
 
         // 影刃刺客背刺：目标没有视线能看到攻击者时伤害翻倍
